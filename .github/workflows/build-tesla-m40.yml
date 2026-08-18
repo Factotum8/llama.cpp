@@ -1,45 +1,297 @@
-name: Build Windows CUDA Tesla M40
+name: Build llama.cpp - Tesla M40 Portable Windows
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-m40:
+    name: Tesla M40 - CUDA 12.4 - sm_52
     runs-on: windows-2022
 
     steps:
+      # ------------------------------------------------------------
+      # Checkout llama.cpp
+      # ------------------------------------------------------------
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
+          fetch-depth: 0
           submodules: recursive
 
-      - name: Setup CUDA
-        uses: Jimver/cuda-toolkit@v0.2.27
+      # ------------------------------------------------------------
+      # Node 24
+      # Avoid Node 20 deprecation warnings in modern GitHub Actions
+      # ------------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
         with:
-          cuda: '12.4.1'
-          method: network
+          node-version: "24"
 
-      - name: Configure
+      # ------------------------------------------------------------
+      # Install CUDA
+      #
+      # Uses llama.cpp's own CUDA installer.
+      # No Jimver/cuda-toolkit.
+      #
+      # CUDA 12.4 is intentionally used because Tesla M40 is Maxwell.
+      # ------------------------------------------------------------
+      - name: Install CUDA 12.4
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: "12.4"
+          cuda_arch: "x64"
+
+      # ------------------------------------------------------------
+      # Verify CUDA
+      # ------------------------------------------------------------
+      - name: Verify CUDA installation
         shell: pwsh
         run: |
-          cmake -B build `
-            -DGGML_CUDA=ON `
-            -DCMAKE_CUDA_ARCHITECTURES=52
+          Write-Host "CUDA_PATH=$env:CUDA_PATH"
 
-      - name: Build
+          if (-not $env:CUDA_PATH) {
+            throw "CUDA_PATH is not defined"
+          }
+
+          nvcc --version
+
+      # ------------------------------------------------------------
+      # Install Ninja
+      # ------------------------------------------------------------
+      - name: Install Ninja
         shell: pwsh
         run: |
-          cmake --build build --config Release -j 2
+          choco install ninja -y
 
-      - name: Pack
+      # ------------------------------------------------------------
+      # Configure llama.cpp
+      #
+      # Tesla M40 = Maxwell = Compute Capability 5.2 = sm_52
+      #
+      # GGML_BACKEND_DL:
+      #   keeps CUDA backend as ggml-cuda.dll
+      #
+      # GGML_NATIVE=OFF:
+      #   avoids optimizing CPU code specifically for GitHub runner
+      #
+      # GGML_OPENMP=OFF:
+      #   avoids an additional OpenMP runtime dependency
+      # ------------------------------------------------------------
+      - name: Configure llama.cpp for Tesla M40
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_CUDA=ON ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_OPENMP=OFF ^
+            -DCMAKE_CUDA_ARCHITECTURES=52 ^
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_SERVER=ON
+
+      # ------------------------------------------------------------
+      # Build
+      # ------------------------------------------------------------
+      - name: Build Release
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+
+          cmake --build build ^
+            --config Release ^
+            -j %NINJA_JOBS%
+
+      # ------------------------------------------------------------
+      # Verify important binaries
+      # ------------------------------------------------------------
+      - name: Verify build
         shell: pwsh
         run: |
+          $bin = "build\bin\Release"
+
+          Write-Host ""
+          Write-Host "=== Build output ==="
+          Get-ChildItem $bin | Sort-Object Name | Format-Table Name, Length
+
+          $required = @(
+            "llama-cli.exe",
+            "llama-server.exe",
+            "ggml-cuda.dll"
+          )
+
+          foreach ($file in $required) {
+            $path = Join-Path $bin $file
+
+            if (-not (Test-Path $path)) {
+              throw "Required file not found: $path"
+            }
+          }
+
+      # ------------------------------------------------------------
+      # Create portable directory
+      # ------------------------------------------------------------
+      - name: Create portable package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $source = Resolve-Path "build\bin\Release"
+          $dest   = "portable"
+
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+          # --------------------------------------------------------
+          # Copy llama.cpp binaries and DLLs
+          # --------------------------------------------------------
+          Copy-Item "$source\*" $dest -Recurse -Force
+
+          # --------------------------------------------------------
+          # Copy CUDA runtime DLLs
+          #
+          # Same runtime libraries packaged by upstream llama.cpp:
+          #
+          # cudart64_*.dll
+          # cublas64_*.dll
+          # cublasLt64_*.dll
+          # --------------------------------------------------------
+          Write-Host ""
+          Write-Host "CUDA_PATH=$env:CUDA_PATH"
+
+          $cudaLocations = @(
+            "$env:CUDA_PATH\bin",
+            "$env:CUDA_PATH\lib",
+            "$env:CUDA_PATH\bin\x64"
+          )
+
+          $cudaPatterns = @(
+            "cudart64_*.dll",
+            "cublas64_*.dll",
+            "cublasLt64_*.dll"
+          )
+
+          foreach ($location in $cudaLocations) {
+
+            if (-not (Test-Path $location)) {
+              continue
+            }
+
+            foreach ($pattern in $cudaPatterns) {
+
+              Get-ChildItem `
+                -Path $location `
+                -Filter $pattern `
+                -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                Write-Host "Copying CUDA DLL: $($_.Name)"
+                Copy-Item $_.FullName $dest -Force
+              }
+            }
+          }
+
+          # --------------------------------------------------------
+          # LICENSE
+          # --------------------------------------------------------
+          Copy-Item LICENSE "$dest\LICENSE" -Force
+
+          # --------------------------------------------------------
+          # Information file
+          # --------------------------------------------------------
+          @"
+          llama.cpp custom build
+
+          GPU:
+            NVIDIA Tesla M40
+
+          Architecture:
+            Maxwell
+
+          CUDA Compute Capability:
+            5.2
+
+          CUDA target:
+            sm_52
+
+          CUDA Toolkit:
+            12.4
+
+          Important:
+            NVIDIA display/compute driver is still required.
+
+          Example:
+
+            llama-cli.exe -m model.gguf -ngl 99
+
+          Server:
+
+            llama-server.exe -m model.gguf -ngl 99 -c 4096
+
+          "@ | Set-Content "$dest\TESLA-M40.txt"
+
+      # ------------------------------------------------------------
+      # Verify CUDA runtime DLLs are present
+      # ------------------------------------------------------------
+      - name: Verify portable package
+        shell: pwsh
+        run: |
+          $requiredPatterns = @(
+            "portable\ggml-cuda.dll",
+            "portable\cudart64_*.dll",
+            "portable\cublas64_*.dll",
+            "portable\cublasLt64_*.dll",
+            "portable\llama-cli.exe",
+            "portable\llama-server.exe"
+          )
+
+          foreach ($pattern in $requiredPatterns) {
+
+            $files = Get-ChildItem $pattern -ErrorAction SilentlyContinue
+
+            if (-not $files) {
+              throw "Required portable component missing: $pattern"
+            }
+          }
+
+          Write-Host ""
+          Write-Host "=== Portable package ==="
+
+          Get-ChildItem portable |
+            Sort-Object Name |
+            Format-Table Name, Length
+
+      # ------------------------------------------------------------
+      # Pack everything into ONE ZIP
+      # ------------------------------------------------------------
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          $zip = "llama-cpp-windows-tesla-m40-cuda12.4-sm52.zip"
+
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
+
           Compress-Archive `
-            -Path build/bin/Release/* `
-            -DestinationPath llama-tesla-m40-windows.zip
+            -Path portable\* `
+            -DestinationPath $zip `
+            -CompressionLevel Optimal
 
-      - name: Upload
-        uses: actions/upload-artifact@v4
+          Write-Host ""
+          Write-Host "Created:"
+          Get-Item $zip | Format-Table Name, Length
+
+      # ------------------------------------------------------------
+      # Upload final ZIP
+      # ------------------------------------------------------------
+      - name: Upload portable Tesla M40 build
+        uses: actions/upload-artifact@v6
         with:
-          name: llama-tesla-m40-windows
-          path: llama-tesla-m40-windows.zip
+          name: llama-cpp-windows-tesla-m40-cuda12.4-sm52
+          path: llama-cpp-windows-tesla-m40-cuda12.4-sm52.zip
+          if-no-files-found: error
