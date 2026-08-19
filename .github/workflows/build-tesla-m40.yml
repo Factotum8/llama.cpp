@@ -76,6 +76,9 @@ jobs:
       #
       # GGML_OPENMP=OFF:
       #   avoids an additional OpenMP runtime dependency
+      #
+      # LLAMA_CUDA_FORCE_MMQ=ON:
+      #   forces MMQ kernels for CUDA matrix multiplication
       # ------------------------------------------------------------
       - name: Configure llama.cpp for Tesla M40
         shell: cmd
@@ -89,6 +92,7 @@ jobs:
             -DGGML_OPENMP=OFF ^
             -DCMAKE_CUDA_ARCHITECTURES=52 ^
             -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DLLAMA_CUDA_FORCE_MMQ=ON ^
             -DLLAMA_BUILD_TESTS=OFF ^
             -DLLAMA_BUILD_EXAMPLES=OFF ^
             -DLLAMA_BUILD_TOOLS=ON ^
@@ -220,6 +224,9 @@ jobs:
 
           CUDA Toolkit:
             12.4
+
+          CUDA MMQ:
+            Forced ON
 
           Important:
             NVIDIA display/compute driver is still required.
